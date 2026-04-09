@@ -3085,6 +3085,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                warmup_mode=False,
                                inputs_embeds=None,
                                model_mm_kwargs=None):
+        exec_start = time.time()
+        logger.info(f"[WARMUP] _execute_model_generic START: batch_size={token_ids.size(0)}, seq_len={self._seq_len(attn_metadata)}, warmup_mode={warmup_mode}")
         # FORWARD.
         batch_size = token_ids.size(0)
         seq_len = self._seq_len(attn_metadata)
@@ -3716,13 +3718,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        sample_start = time.time()
+        logger.info(f"[WARMUP] sample_tokens started, warmup_mode={self.warmup_mode}, scheduler_output={self.scheduler_output is not None}")
+        
         if self.scheduler_output is None:
             # Nothing to do (PP non-final rank case), output isn't used.
+            logger.info(f"[WARMUP] sample_tokens returning None (no scheduler_output)")
             return None  # noqa
         scheduler_output = self.scheduler_output
         warmup_mode = self.warmup_mode
         self.scheduler_output = None
         self.warmup_mode = False
+        logger.info(f"[WARMUP] sample_tokens continuing, warmup_mode was {warmup_mode}")
 
         # NOTE(kzawora): Since scheduler doesn't differentiate between prefills
         # and decodes, we must handle mixed batches. In _update_states we make
@@ -3789,9 +3796,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         num_reqs = num_decodes + num_prefills
         if self.use_async_scheduling:
             self.invalid_req_indices: list[int] = []
+        logger.info(f"[WARMUP] sample_tokens: calling _prepare_inputs (num_prefills={num_prefills}, num_decodes={num_decodes})")
         with self.profiler.record_event('internal', 'prepare_input_tensors'):
             prefill_input_data, decode_input_data = self._prepare_inputs(scheduler_output, num_prefills, num_decodes,
                                                                          warmup_mode)
+        logger.info(f"[WARMUP] sample_tokens: _prepare_inputs completed")
         prefill_data, \
             dummy_prefill_input_data_batches_across_dp = prefill_input_data
         num_pad_prefill_batch_across_dp = \
@@ -3837,24 +3846,31 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         ######################### PREFILLS #########################
         if num_prefills > 0:
+            logger.info(f"[WARMUP] sample_tokens: entering prefill loop (num_prefills={num_prefills})")
             htorch.core.mark_step()
             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
                       logits_requests) in enumerate(zip(*shallow_tuple(prefill_data))):
+                logger.info(f"[WARMUP] sample_tokens: prefill iteration {idx}, req_id={req_id}, token_ids.shape={token_ids.shape}")
 
                 # Prepare multimodal inputs if any
+                logger.info(f"[WARMUP] sample_tokens: calling _get_model_mm_inputs")
                 inputs_embeds, model_mm_kwargs = self._get_model_mm_inputs(
                     token_ids,
                     token_ids.shape[-1],
                     scheduler_output,
                     req_id,
                 )
+                logger.info(f"[WARMUP] sample_tokens: _get_model_mm_inputs completed")
 
+                logger.info(f"[WARMUP] sample_tokens: calling _configure_lora")
                 lora_mask, lora_logits_mask = self._configure_lora(token_ids, self.requests, req_id, True)
+                logger.info(f"[WARMUP] sample_tokens: _configure_lora completed")
 
                 self.event_start = self.profiler.get_timestamp_us()
                 self.profiler.start("internal", "prefill")
 
                 htorch.core.mark_step()
+                logger.info(f"[WARMUP] sample_tokens: calling _execute_model_generic (warmup_mode={warmup_mode})")
                 non_flattened_hidden_states, aux_hidden_states, \
                     sample_hidden_states, logits_device = \
                     self._execute_model_generic(
@@ -4192,6 +4208,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if has_kv_transfer_group():
             get_kv_transfer_group().clear_connector_metadata()
 
+        sample_elapsed = time.time() - sample_start
+        logger.info(f"[WARMUP] sample_tokens completed in {sample_elapsed:.2f}s")
         return model_runner_output
 
     @with_thread_limits()
@@ -4786,10 +4804,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         developer_settings = get_config().VLLM_DEVELOPER_MODE
         phase = 'Prompt' if is_prompt else 'Decode'
         desc = f'{phase} warmup processing: '
+        
+        import datetime
+        warmup_start_time = time.time()
+        
         with tqdm(total=num_candidates, desc=desc, unit="item") as pbar:
             for idx, (batch_size, seq_len, num_blocks) in enumerate(reversed(buckets)):
                 if seq_len > self.max_num_tokens:
                     continue
+                
+                bucket_start_time = time.time()
+                bucket_info = f"bucket[{idx}]: bs={batch_size}, seq={seq_len}, blocks={num_blocks}"
+                logger.info(f"[WARMUP-{phase}] Starting {bucket_info}")
+                
+                if is_prompt:
+                    total_tokens = batch_size * (seq_len + num_blocks * self.block_size)
+                    logger.info(f"[WARMUP-{phase}] {bucket_info} -> total_tokens={total_tokens}, "
+                               f"max_model_len={self.max_model_len}, max_num_tokens={self.max_num_tokens}")
+                
                 # Graph memory usage is proportional to seq dimension in a batch
                 if is_prompt:
                     batch_seq = batch_size * seq_len * num_blocks if num_blocks else batch_size * seq_len
@@ -4798,22 +4830,33 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
                 graphed_bucket = (batch_size, seq_len, num_blocks, is_prompt)
                 if graphed_bucket in self.graphed_buckets:
+                    logger.debug(f"[WARMUP-{phase}] Skipping already graphed bucket: {graphed_bucket}")
                     continue
                 self.graphed_buckets.add(graphed_bucket)
                 if developer_settings:
                     self.log_warmup(phase, idx, num_candidates, batch_size, seq_len, num_blocks)
+                
                 prompt_cfg, decode_cfg = None, None
+                logger.info(f"[WARMUP-{phase}] Entering HabanaMemoryProfiler for {bucket_info}")
                 with HabanaMemoryProfiler() as mem_prof:
                     if is_prompt:
                         prompt_cfg = (batch_size, seq_len, num_blocks)
                     else:
                         decode_cfg = (batch_size, 1, num_blocks)
+                    logger.info(f"[WARMUP-{phase}] Calling _prepare_dummy_scenario with "
+                               f"prompt_cfg={prompt_cfg}, decode_cfg={decode_cfg}")
                     self._prepare_dummy_scenario(prompt_cfg, decode_cfg)
-                # TODO(kzawora): align_workers
+                logger.info(f"[WARMUP-{phase}] _prepare_dummy_scenario completed for {bucket_info}")
+                
                 used_mem = mem_prof.consumed_device_memory
                 total_mem += used_mem
                 total_batch_seq += batch_seq
 
+                bucket_elapsed = time.time() - bucket_start_time
+                logger.info(f"[WARMUP-{phase}] Completed {bucket_info} in {bucket_elapsed:.2f}s, "
+                           f"memory_used={used_mem/1024**3:.2f}GB, "
+                           f"total_elapsed={time.time()-warmup_start_time:.2f}s")
+                
                 pbar.set_postfix_str(f"{idx}/{num_candidates}")
                 pbar.update(1)
 
@@ -4954,12 +4997,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         num_speculative_tokens = self.speculative_config.num_speculative_tokens
                         tokens -= num_speculative_tokens
                         prompt_query_len -= num_speculative_tokens
+                    request_start = time.time()
                     self._add_dummy_request(requests,
                                             scheduled_tokens,
                                             num_computed_tokens=(context_len * self.block_size),
                                             total_tokens=tokens,
                                             scheduled_tokens=prompt_query_len,
                                             is_prompt=True)
+                    logger.debug(f"[WARMUP-Prompt] Added {len(requests)} requests in {time.time()-request_start:.2f}s")
         if decode_cfg:
             decode_bs, decode_query_len, decode_num_blocks = decode_cfg
             if self.use_contiguous_pa:
@@ -4976,11 +5021,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                         scheduled_tokens=1,
                                         is_prompt=False,
                                         block_id=block_id)
+        logger.info(f"[WARMUP] Executing dummy scenario with {len(requests)} requests")
         self._execute_dummy_scenario(requests, scheduled_tokens)
 
     def _execute_dummy_scenario(self, requests, scheduled_tokens):
         from vllm.v1.core.sched.output import (SchedulerOutput, CachedRequestData)
+        import signal
 
+        logger.info(f"[WARMUP] Creating SchedulerOutput with {len(requests)} requests")
+        exec_start = time.time()
+        
         sched_output = SchedulerOutput(
             scheduled_new_reqs=requests,
             scheduled_cached_reqs=CachedRequestData.make_empty(),
@@ -4992,6 +5042,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
         )
+        logger.info(f"[WARMUP] Created sched_output, calling execute_model (warmup_mode=True)")
+        
+        self.execute_model(sched_output, warmup_mode=True)
+        logger.info(f"[WARMUP] First execute_model completed in {time.time()-exec_start:.2f}s")
+        
+        self.sample_tokens(None)
+        logger.info(f"[WARMUP] sample_tokens completed")
+        
         cleanup = SchedulerOutput(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
@@ -5003,9 +5061,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             finished_req_ids=set(req.req_id for req in requests),
             free_encoder_mm_hashes=[],
         )
-        self.execute_model(sched_output, warmup_mode=True)
-        self.sample_tokens(None)
+        logger.info(f"[WARMUP] Calling cleanup execute_model")
         self.execute_model(cleanup, warmup_mode=True)
+        logger.info(f"[WARMUP] Cleanup execute_model completed, total time: {time.time()-exec_start:.2f}s")
 
     def _generate_profiling(self, prompt_cfg, decode_cfg):
         steps = 3
